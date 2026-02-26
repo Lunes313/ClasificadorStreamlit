@@ -17,6 +17,7 @@ from sklearn.neighbors import KNeighborsClassifier
 from sklearn.neural_network import MLPClassifier
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
+from sklearn.svm import LinearSVC
 from sklearn.svm import SVC
 from streamlit_drawable_canvas import st_canvas
 
@@ -43,26 +44,35 @@ class ModelResult:
 
 @st.cache_data(show_spinner=True)
 def load_mnist_data() -> tuple[np.ndarray, np.ndarray]:
-    mnist = fetch_openml("mnist_784", version=1, as_frame=False, parser="auto")
+    mnist = fetch_openml("mnist_784", version=1, as_frame=False, parser="auto", cache=True)
     X = mnist.data.astype(np.float32) / 255.0
     y = mnist.target.astype(np.int64)
     return X, y
 
 
-def build_models(random_state: int) -> dict[str, object]:
+def build_models(random_state: int, fast_mode: bool) -> dict[str, object]:
+    lr_max_iter = 120 if fast_mode else 350
+    svm_model = LinearSVC(C=1.0, random_state=random_state) if fast_mode else SVC(
+        kernel="rbf", C=3.0, gamma="scale", probability=False, random_state=random_state
+    )
+    knn_neighbors = 3 if fast_mode else 5
+    rf_estimators = 50 if fast_mode else 160
+    mlp_hidden = (64,) if fast_mode else (128,)
+    mlp_iter = 12 if fast_mode else 25
+
     return {
         "Logistic Regression": make_pipeline(
             StandardScaler(),
-            LogisticRegression(max_iter=350, random_state=random_state, n_jobs=None),
+            LogisticRegression(max_iter=lr_max_iter, random_state=random_state, solver="saga", n_jobs=-1),
         ),
-        "SVM (RBF)": make_pipeline(
+        "SVM": make_pipeline(
             StandardScaler(),
-            SVC(kernel="rbf", C=3.0, gamma="scale", probability=True, random_state=random_state),
+            svm_model,
         ),
-        "KNN": make_pipeline(StandardScaler(), KNeighborsClassifier(n_neighbors=5)),
+        "KNN": make_pipeline(StandardScaler(), KNeighborsClassifier(n_neighbors=knn_neighbors)),
         "Random Forest": RandomForestClassifier(
-            n_estimators=160,
-            max_depth=20,
+            n_estimators=rf_estimators,
+            max_depth=16,
             min_samples_split=2,
             random_state=random_state,
             n_jobs=-1,
@@ -70,12 +80,12 @@ def build_models(random_state: int) -> dict[str, object]:
         "Red Neuronal Simple (MLP)": make_pipeline(
             StandardScaler(),
             MLPClassifier(
-                hidden_layer_sizes=(128,),
+                hidden_layer_sizes=mlp_hidden,
                 activation="relu",
                 solver="adam",
                 learning_rate_init=0.001,
                 batch_size=256,
-                max_iter=25,
+                max_iter=mlp_iter,
                 random_state=random_state,
             ),
         ),
@@ -83,7 +93,7 @@ def build_models(random_state: int) -> dict[str, object]:
 
 
 @st.cache_resource(show_spinner=True)
-def train_models(sample_size: int, test_size: float, random_state: int):
+def train_models(sample_size: int, test_size: float, random_state: int, fast_mode: bool):
     X, y = load_mnist_data()
 
     if sample_size < len(X):
@@ -107,21 +117,24 @@ def train_models(sample_size: int, test_size: float, random_state: int):
 
     model_results: list[ModelResult] = []
 
-    for model_name, model in build_models(random_state).items():
-        model.fit(X_train, y_train)
-        y_pred = model.predict(X_valid)
+    for model_name, model in build_models(random_state, fast_mode).items():
+        try:
+            model.fit(X_train, y_train)
+            y_pred = model.predict(X_valid)
 
-        model_results.append(
-            ModelResult(
-                name=model_name,
-                estimator=model,
-                accuracy=accuracy_score(y_valid, y_pred),
-                precision=precision_score(y_valid, y_pred, average="macro", zero_division=0),
-                recall=recall_score(y_valid, y_pred, average="macro", zero_division=0),
-                f1=f1_score(y_valid, y_pred, average="macro", zero_division=0),
-                confusion_matrix=confusion_matrix(y_valid, y_pred, labels=np.arange(10)),
+            model_results.append(
+                ModelResult(
+                    name=model_name,
+                    estimator=model,
+                    accuracy=accuracy_score(y_valid, y_pred),
+                    precision=precision_score(y_valid, y_pred, average="macro", zero_division=0),
+                    recall=recall_score(y_valid, y_pred, average="macro", zero_division=0),
+                    f1=f1_score(y_valid, y_pred, average="macro", zero_division=0),
+                    confusion_matrix=confusion_matrix(y_valid, y_pred, labels=np.arange(10)),
+                )
             )
-        )
+        except Exception:
+            continue
 
     metrics_df = pd.DataFrame(
         {
@@ -173,16 +186,33 @@ def main():
     )
 
     st.sidebar.header("⚙️ Configuración")
-    sample_size = st.sidebar.slider("Tamaño de muestra para entrenamiento", 5000, 70000, 12000, step=1000)
+    fast_mode = st.sidebar.checkbox("Modo rápido (recomendado para Streamlit Cloud)", value=True)
+    sample_size = st.sidebar.slider("Tamaño de muestra para entrenamiento", 2000, 20000, 4000, step=1000)
     test_size_pct = st.sidebar.slider("Porcentaje de validación", 10, 40, 20, step=5)
     random_state = st.sidebar.number_input("Semilla aleatoria", min_value=0, max_value=9999, value=42, step=1)
+    train_button = st.sidebar.button("Entrenar / Reentrenar modelos", type="primary")
 
-    with st.spinner("Entrenando modelos y evaluando desempeño..."):
-        model_results, metrics_df, X_valid, y_valid = train_models(
-            sample_size=sample_size,
-            test_size=test_size_pct / 100,
-            random_state=int(random_state),
-        )
+    if "training_output" not in st.session_state:
+        st.session_state.training_output = None
+
+    if train_button:
+        with st.spinner("Entrenando modelos y evaluando desempeño..."):
+            st.session_state.training_output = train_models(
+                sample_size=sample_size,
+                test_size=test_size_pct / 100,
+                random_state=int(random_state),
+                fast_mode=fast_mode,
+            )
+
+    if st.session_state.training_output is None:
+        st.info("Configura parámetros en la barra lateral y pulsa 'Entrenar / Reentrenar modelos'.")
+        st.stop()
+
+    model_results, metrics_df, X_valid, y_valid = st.session_state.training_output
+
+    if len(model_results) == 0:
+        st.error("No se pudo entrenar ningún modelo con la configuración actual. Reduce el tamaño de muestra.")
+        st.stop()
 
     st.success("Entrenamiento completado. Ya puedes comparar modelos y hacer predicciones.")
 
